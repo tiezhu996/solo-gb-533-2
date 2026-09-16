@@ -94,6 +94,19 @@ func (repository *ValidationRunRepository) Finish(run *model.ValidationRun) erro
 	return nil
 }
 
+func (repository *ValidationRunRepository) AcceptedForPrograms(programIDs []uint) ([]model.ValidationRun, error) {
+	if len(programIDs) == 0 {
+		return nil, nil
+	}
+	var runs []model.ValidationRun
+	if err := repository.db.Preload("MotionProgram").
+		Where("motion_program_id IN ? AND validation_status = ?", programIDs, "accepted").
+		Order("id ASC").Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("list accepted validation runs: %w", err)
+	}
+	return runs, nil
+}
+
 func (repository *ValidationRunRepository) Review(id uint, from, to string, reviewer uint, note string) error {
 	result := repository.db.Model(&model.ValidationRun{}).Where("id = ? AND validation_status = ?", id, from).
 		Updates(map[string]any{"validation_status": to, "reviewed_by": reviewer, "reviewed_at": gorm.Expr("CURRENT_TIMESTAMP"), "review_note": note})

@@ -77,6 +77,20 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 - `failed` 结果可显式重试，新记录保存 `attempt` 和 `retry_of_id`，不会覆盖旧尝试。
 - `accepted` 只表示离线证据被独立记录，不等于机器人可运行。
 
+## 安全区域修订影响模块
+
+修订影响是区域变更的受控通道，**只保留一条执行入口**：未发布草案经 `POST /zones/:id/revisions/publish` 落定。旧的直接 `PUT /zones/:id` 修订路径仍可建草案，但工作单元内的版本推进与影响判定统一由发布入口完成。
+
+规则：
+
+- **每个区域至多一份未发布草案**：`zone_revisions` 对 `(safety_zone_id, open_draft_slot)` 建立部分唯一索引（已发布记录的槽位为 NULL）。重复保存草案是更新同一条，而不是新建。
+- **发布生成唯一新版本**：发布把修订定义条件化地复制到活动区域行并把 `version` 加一；`(safety_zone_id, published_version)` 唯一索引保证版本不重复，乐观版本不匹配返回 409。
+- **列出工作单元内受影响的活动程序**：发布时对同一工作单元的每个 `active` 运动程序，用修订后的区域重新做扩张包络求交，冻结逐条 `ZoneRevisionImpact`（是否受影响、接触次数、首次接触段与时刻、净距、实际/允许速度和判定依据）。
+- **版本与影响清单一起落定**：区域版本推进、草案转已发布、影响清单写入、已接受校验标记全部在**同一个数据库事务**内完成；任一步失败整体回滚，草案保持未发布、区域版本不变、不留半截影响清单。
+- **已接受校验只标记待重评**：发布只会为受影响活动程序的 `accepted` 校验运行新增独立的 `validation_reevaluations` 标记；校验运行本身的状态、碰撞/联锁证据、风险分和输入哈希**保持不变且可随时回读**。已被早前修订标记过的运行不会重复标记。
+
+前端在 `/zones` 页选中区域后，通过共享 `RevisionPanel` 组件展示唯一草案、发布按钮、最近一次发布的逐程序影响表，以及待重评的已接受校验清单；绘制画布的“Revise (draft)”把修订写入该模块的草案，而不是直接覆盖活动区域。新增 `RevisionStatus = draft | published` 枚举（后端 `constants/zone_revision.go`，前端 `types/enums/revision-status.ts`）。
+
 ## 包络算法、假设与误差边界
 
 轨迹点格式：
@@ -170,6 +184,16 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 - 状态机测试：`backend/internal/constants/validation_status_test.go`
 - 前端类型/store/component/page：`frontend/src/types/enums/validation-status.ts`、`stores/validation-run.store.ts`、`components/common/cell-state-badge.component.ts`、`pages/validation.page.ts`
 
+### RevisionStatus
+
+值：`draft | published`（区域修订草案/已发布修订）。
+
+- 后端常量：`backend/internal/constants/zone_revision.go`
+- 数据库/model：`backend/internal/model/zone_revision.go`（`ZoneRevision`、`ZoneRevisionImpact`、`ValidationReevaluation`）
+- DTO/repository/service/handler/router：`backend/internal/dto/zone_revision.go`、`repository/zone_revision.go`、`service/zone_revision.go`、`handler/zone_revision.go`、`router/zone_revision.go`
+- 事务与回滚测试：`backend/internal/service/zone_revision_test.go`
+- 前端类型/api/store/component/page：`frontend/src/types/enums/revision-status.ts`、`types/zone-revision.ts`、`api/zone-revision.ts`、`stores/zone-revision.store.ts`、`components/common/revision-panel.component.ts`、`pages/zones.page.ts`
+
 ## API
 
 统一前缀为 `/api/v1`；所有响应包含 `request_id`。
@@ -183,6 +207,8 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 | GET/POST | `/zones` | 列表、区域创建 |
 | GET/PUT | `/zones/:id` | 详情、版本修订 |
 | POST | `/zones/:id/activate`、`deactivate` | 区域状态动作 |
+| GET | `/zones/:id/revisions`、`/revisions/draft`、`/revisions/:revisionId` | 修订历史、唯一未发布草案、已发布修订（含影响清单与重评标记） |
+| PUT/POST | `/zones/:id/revisions/draft`、`/revisions/publish` | 保存未发布草案、**唯一发布入口**（事务化落定版本与影响清单） |
 | GET/POST | `/programs` | 列表、结构化程序导入 |
 | GET | `/programs/:id` | 程序详情和 checksum |
 | POST | `/programs/:id/transition` | 程序状态迁移 |
@@ -191,7 +217,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 | POST | `/validations/:id/review`、`accept`、`void` | 人工处置 |
 | GET | `/audit` | 审计筛选 |
 
-健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`version_conflict`、`state_conflict`、`forbidden` 和 `unauthorized`。
+健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`invalid_revision_geometry`、`version_conflict`、`state_conflict`、`draft_exists`、`draft_missing`、`forbidden` 和 `unauthorized`。
 
 ## 环境变量和端口
 

@@ -62,6 +62,14 @@ func (repository *MotionProgramRepository) Transition(id uint, from, to string) 
 	return nil
 }
 
+func (repository *MotionProgramRepository) ActiveForCell(cellID uint) ([]model.MotionProgram, error) {
+	var programs []model.MotionProgram
+	if err := repository.db.Where("robot_cell_id = ? AND program_state = ?", cellID, "active").Order("id ASC").Find(&programs).Error; err != nil {
+		return nil, fmt.Errorf("list active motion programs for cell: %w", err)
+	}
+	return programs, nil
+}
+
 func (repository *MotionProgramRepository) SupersedeActive(cellID, exceptID uint) error {
 	if err := repository.db.Model(&model.MotionProgram{}).
 		Where("robot_cell_id = ? AND id <> ? AND program_state = ?", cellID, exceptID, "active").

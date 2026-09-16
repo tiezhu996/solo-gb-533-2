@@ -8,15 +8,17 @@ import { MatSelectModule } from '@angular/material/select';
 import { LucideAngularModule } from 'lucide-angular';
 import { RobotCellStore } from '../stores/robot-cell.store';
 import { SafetyZoneStore } from '../stores/safety-zone.store';
+import { ZoneRevisionStore } from '../stores/zone-revision.store';
 import { SafetyZone } from '../types/safety-zone';
 import { ZoneType, ZONE_TYPES } from '../types/enums/zone-type';
 import { useAuth } from '../hooks/use-auth';
 import { CanvasPoint, SafetyCanvasComponent } from '../components/common/safety-canvas.component';
 import { CellStateBadgeComponent } from '../components/common/cell-state-badge.component';
+import { RevisionPanelComponent } from '../components/common/revision-panel.component';
 
 @Component({
   standalone: true,
-  imports: [DecimalPipe, ReactiveFormsModule, MatButtonModule, MatFormFieldModule, MatInputModule, MatSelectModule, LucideAngularModule, SafetyCanvasComponent, CellStateBadgeComponent],
+  imports: [DecimalPipe, ReactiveFormsModule, MatButtonModule, MatFormFieldModule, MatInputModule, MatSelectModule, LucideAngularModule, SafetyCanvasComponent, CellStateBadgeComponent, RevisionPanelComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <section class="page-head"><div><span>Geometry editor</span><h1>Safety zones</h1></div><div class="head-actions"><button mat-stroked-button type="button" (click)="reload()"><lucide-icon name="refresh-cw" [size]="16" />Refresh</button>@if (canEdit()) { <button mat-flat-button color="primary" type="button" (click)="newZone()"><lucide-icon name="plus" [size]="16" />Draw zone</button> }</div></section>
@@ -38,13 +40,16 @@ import { CellStateBadgeComponent } from '../components/common/cell-state-badge.c
         </div>
         @if (zones.selected(); as zone) {
           <dl><div><dt>Height</dt><dd>{{ zone.min_height_mm | number:'1.0-0' }}–{{ zone.max_height_mm | number:'1.0-0' }} mm</dd></div><div><dt>Speed limit</dt><dd>{{ zone.speed_limit_mm_s | number:'1.0-0' }} mm/s</dd></div><div class="wide"><dt>Access rule</dt><dd>{{ zone.access_rule }}</dd></div></dl>
-          @if (canEdit()) { <div class="zone-actions"><button mat-stroked-button type="button" (click)="editZone(zone)">Revise</button>@if (zone.zone_state === 'draft') { <button mat-flat-button color="primary" type="button" (click)="zones.activate(zone)">Activate</button> } @if (zone.zone_state !== 'inactive') { <button mat-button class="danger" type="button" (click)="zones.deactivate(zone)">Deactivate</button> }</div> }
+          @if (canEdit()) { <div class="zone-actions"><button mat-stroked-button type="button" (click)="startRevision(zone)"><lucide-icon name="git-branch" [size]="14" />Revise (draft)</button>@if (zone.zone_state === 'draft') { <button mat-flat-button color="primary" type="button" (click)="zones.activate(zone)">Activate</button> } @if (zone.zone_state !== 'inactive') { <button mat-button class="danger" type="button" (click)="zones.deactivate(zone)">Deactivate</button> }</div> }
         }
       </aside>
     </section>
+    @if (zones.selected(); as selectedZone) {
+      <app-revision-panel [zone]="selectedZone" (revise)="startRevision($event)" (publishedChange)="onRevisionPublished()" />
+    }
     @if (editorOpen()) {
       <section class="zone-editor">
-        <header><div><span>{{ editing() ? 'Zone revision' : 'New geometry' }}</span><h2>{{ editing()?.name ?? 'Click the canvas to place vertices' }}</h2></div><button mat-icon-button aria-label="Close editor" (click)="closeEditor()"><lucide-icon name="x" [size]="18" /></button></header>
+        <header><div><span>{{ editorKind() }}</span><h2>{{ revisionOf()?.name ?? editing()?.name ?? 'Click the canvas to place vertices' }}</h2></div><button mat-icon-button aria-label="Close editor" (click)="closeEditor()"><lucide-icon name="x" [size]="18" /></button></header>
         <form [formGroup]="form" (ngSubmit)="save()">
           <mat-form-field appearance="outline"><mat-label>Name</mat-label><input matInput formControlName="name" /></mat-form-field>
           <mat-form-field appearance="outline"><mat-label>Zone type</mat-label><mat-select formControlName="zone_type">@for (type of zoneTypes; track type) { <mat-option [value]="type">{{ type }}</mat-option> }</mat-select></mat-form-field>
@@ -53,7 +58,7 @@ import { CellStateBadgeComponent } from '../components/common/cell-state-badge.c
           <mat-form-field appearance="outline"><mat-label>Speed limit (mm/s)</mat-label><input matInput type="number" formControlName="speed_limit_mm_s" /></mat-form-field>
           <mat-form-field appearance="outline" class="rule"><mat-label>Access rule</mat-label><input matInput formControlName="access_rule" /></mat-form-field>
           <div class="geometry-readout"><span>Polygon</span><code>{{ polygonPreview() }}</code></div>
-          <div class="form-actions"><button mat-button type="button" (click)="closeEditor()">Cancel</button><button mat-flat-button color="primary" type="submit" [disabled]="form.invalid || draftPoints().length < 3 || zones.loading()"><lucide-icon name="save" [size]="16" />{{ editing() ? 'Save revision' : 'Create zone' }}</button></div>
+          <div class="form-actions"><button mat-button type="button" (click)="closeEditor()">Cancel</button><button mat-flat-button color="primary" type="submit" [disabled]="form.invalid || draftPoints().length < 3 || zones.loading() || revisions.loading()"><lucide-icon name="save" [size]="16" />{{ revisionOf() ? 'Save revision draft' : 'Create zone' }}</button></div>
         </form>
       </section>
     }
@@ -67,15 +72,18 @@ export class ZonesPage implements OnInit {
   private readonly fb = inject(FormBuilder);
   readonly cells = inject(RobotCellStore);
   readonly zones = inject(SafetyZoneStore);
+  readonly revisions = inject(ZoneRevisionStore);
   readonly auth = useAuth();
   readonly cellId = signal<number | undefined>(undefined);
   readonly editorOpen = signal(false);
   readonly editing = signal<SafetyZone | null>(null);
+  readonly revisionOf = signal<SafetyZone | null>(null);
   readonly draftPoints = signal<CanvasPoint[]>([]);
   readonly zoneTypes = ZONE_TYPES;
   readonly activeCount = computed(() => this.zones.items().filter((zone) => zone.zone_state === 'active').length);
   readonly selectedCellCode = computed(() => this.cells.items().find((cell) => cell.id === this.cellId())?.cell_code ?? 'All cells');
   readonly polygonPreview = computed(() => JSON.stringify(this.polygon()));
+  readonly editorKind = computed(() => this.revisionOf() ? 'Unpublished revision draft (impact list fixed on publish)' : 'New geometry');
   readonly form = this.fb.nonNullable.group({
     name: ['QA light curtain buffer', Validators.required], zone_type: ['restricted' as ZoneType, Validators.required],
     min_height_mm: [0, Validators.min(0)], max_height_mm: [2200, [Validators.required, Validators.min(1)]],
@@ -88,24 +96,30 @@ export class ZonesPage implements OnInit {
   newZone(): void {
     const defaultCell = this.cellId() ?? this.cells.items()[0]?.id;
     if (defaultCell) this.cellId.set(defaultCell);
-    this.editing.set(null); this.draftPoints.set([]); this.form.reset({ name: 'QA light curtain buffer', zone_type: 'restricted', min_height_mm: 0, max_height_mm: 2200, speed_limit_mm_s: 250, access_rule: 'Gate lock and light curtain clear required' }); this.editorOpen.set(true);
+    this.editing.set(null); this.revisionOf.set(null); this.draftPoints.set([]); this.form.reset({ name: 'QA light curtain buffer', zone_type: 'restricted', min_height_mm: 0, max_height_mm: 2200, speed_limit_mm_s: 250, access_rule: 'Gate lock and light curtain clear required' }); this.editorOpen.set(true);
   }
-  editZone(zone: SafetyZone): void {
-    this.editing.set(zone); this.cellId.set(zone.robot_cell_id); this.draftPoints.set(this.coordinates(zone));
+  startRevision(zone: SafetyZone): void {
+    this.editing.set(zone); this.revisionOf.set(zone); this.cellId.set(zone.robot_cell_id); this.draftPoints.set(this.coordinates(zone));
     this.form.setValue({ name: zone.name, zone_type: zone.zone_type, min_height_mm: zone.min_height_mm, max_height_mm: zone.max_height_mm, speed_limit_mm_s: zone.speed_limit_mm_s, access_rule: zone.access_rule }); this.editorOpen.set(true);
   }
   addPoint(point: CanvasPoint): void { this.draftPoints.update((points) => [...points, point]); }
   undoPoint(): void { this.draftPoints.update((points) => points.slice(0, -1)); }
   resetPoints(): void { this.draftPoints.set([]); }
-  closeEditor(): void { this.editorOpen.set(false); this.editing.set(null); this.draftPoints.set([]); }
+  closeEditor(): void { this.editorOpen.set(false); this.editing.set(null); this.revisionOf.set(null); this.draftPoints.set([]); }
   save(): void {
     const robotCellId = this.cellId();
     if (this.form.invalid || !robotCellId || this.draftPoints().length < 3) return;
     const value = this.form.getRawValue();
-    const current = this.editing();
     const base = { name: value.name, zone_type: value.zone_type, polygon_geojson: this.polygon(), min_height_mm: value.min_height_mm, max_height_mm: value.max_height_mm, speed_limit_mm_s: value.speed_limit_mm_s, access_rule: value.access_rule };
-    if (current) this.zones.update(current.id, { ...base, version: current.version }, () => this.closeEditor());
-    else this.zones.create({ ...base, robot_cell_id: robotCellId }, () => this.closeEditor());
+    const revisionTarget = this.revisionOf();
+    if (revisionTarget) {
+      this.revisions.saveDraft(revisionTarget.id, { ...base, expected_version: revisionTarget.version }, () => { this.closeEditor(); });
+      return;
+    }
+    this.zones.create({ ...base, robot_cell_id: robotCellId }, () => this.closeEditor());
+  }
+  onRevisionPublished(): void {
+    this.zones.load(this.cellId());
   }
   private polygon(): Record<string, unknown> {
     const points = this.draftPoints();

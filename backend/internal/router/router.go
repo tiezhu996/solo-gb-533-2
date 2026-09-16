@@ -18,6 +18,7 @@ type handlers struct {
 	system      *handler.SystemHandler
 	cells       *handler.RobotCellHandler
 	zones       *handler.SafetyZoneHandler
+	revisions   *handler.ZoneRevisionHandler
 	programs    *handler.MotionProgramHandler
 	validations *handler.ValidationRunHandler
 	auth        *service.SystemService
@@ -36,6 +37,7 @@ func New(db *gorm.DB, cfg config.Config) *gin.Engine {
 	protected.Use(middleware.Auth(wired.auth))
 	registerRobotCellRoutes(protected, wired.cells)
 	registerSafetyZoneRoutes(protected, wired.zones)
+	registerZoneRevisionRoutes(protected, wired.revisions)
 	registerMotionProgramRoutes(protected, wired.programs)
 	registerValidationRunRoutes(protected, wired.validations)
 	protected.GET("/audit", middleware.RBAC(constants.RoleAuditor, constants.RoleReviewer, constants.RoleAdmin), wired.system.Audit)
@@ -49,16 +51,19 @@ func wire(db *gorm.DB, cfg config.Config) handlers {
 	systemRepository := repository.NewSystemRepository(db)
 	cellRepository := repository.NewRobotCellRepository(db)
 	zoneRepository := repository.NewSafetyZoneRepository(db)
+	revisionRepository := repository.NewZoneRevisionRepository(db)
 	programRepository := repository.NewMotionProgramRepository(db)
 	validationRepository := repository.NewValidationRunRepository(db)
 	systemService := service.NewSystemService(systemRepository, cfg.JWTSecret, cfg.JWTTTL)
 	cellService := service.NewRobotCellService(cellRepository, systemService)
 	zoneService := service.NewSafetyZoneService(zoneRepository, cellRepository, systemService)
+	revisionService := service.NewZoneRevisionService(db, revisionRepository, zoneRepository, programRepository, validationRepository, systemService)
 	programService := service.NewMotionProgramService(db, programRepository, cellRepository, systemService)
 	validationService := service.NewValidationRunService(db, validationRepository, programRepository, zoneRepository, systemService, cfg.AlgorithmVersion)
 	return handlers{
 		system: handler.NewSystemHandler(systemService, db), cells: handler.NewRobotCellHandler(cellService),
-		zones: handler.NewSafetyZoneHandler(zoneService), programs: handler.NewMotionProgramHandler(programService),
+		zones: handler.NewSafetyZoneHandler(zoneService), revisions: handler.NewZoneRevisionHandler(revisionService),
+		programs:    handler.NewMotionProgramHandler(programService),
 		validations: handler.NewValidationRunHandler(validationService), auth: systemService,
 	}
 }

@@ -18,7 +18,12 @@ export class SafetyZoneStore {
     this.api.list(robotCellId).pipe(finalize(() => this.loading.set(false))).subscribe({
       next: ({ data }) => {
         this.items.set(data);
-        if (!this.selected() && data.length) this.selected.set(data[0]);
+        const current = this.selected();
+        if (current) {
+          this.selected.set(data.find((item) => item.id === current.id) ?? current);
+        } else if (data.length) {
+          this.selected.set(data[0]);
+        }
       },
       error: (error) => this.error.set(apiErrorMessage(error)),
     });
