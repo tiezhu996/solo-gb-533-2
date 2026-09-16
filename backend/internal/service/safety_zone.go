@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"errors"
 	"strings"
 
 	"robot-cell-safety-envelope-validator/backend/internal/constants"
@@ -14,13 +13,12 @@ import (
 
 type SafetyZoneService struct {
 	repository *repository.SafetyZoneRepository
-	revisions  *repository.ZoneRevisionRepository
 	cells      *repository.RobotCellRepository
 	system     *SystemService
 }
 
-func NewSafetyZoneService(repository *repository.SafetyZoneRepository, revisions *repository.ZoneRevisionRepository, cells *repository.RobotCellRepository, system *SystemService) *SafetyZoneService {
-	return &SafetyZoneService{repository: repository, revisions: revisions, cells: cells, system: system}
+func NewSafetyZoneService(repository *repository.SafetyZoneRepository, cells *repository.RobotCellRepository, system *SystemService) *SafetyZoneService {
+	return &SafetyZoneService{repository: repository, cells: cells, system: system}
 }
 
 func (service *SafetyZoneService) Create(request dto.CreateSafetyZoneRequest, actor dto.Actor, requestID string) (dto.SafetyZoneResponse, error) {
@@ -73,45 +71,17 @@ func (service *SafetyZoneService) List(page, pageSize int, cellID uint, state, z
 }
 
 func (service *SafetyZoneService) Update(id uint, request dto.UpdateSafetyZoneRequest, actor dto.Actor, requestID string) (dto.SafetyZoneResponse, error) {
-	if err := validateZone(request.ZoneType, request.PolygonGeoJSON, request.MinHeightMM, request.MaxHeightMM, request.SpeedLimitMMS); err != nil {
-		return dto.SafetyZoneResponse{}, err
-	}
-	before, err := service.repository.Get(id)
-	if err != nil {
-		return dto.SafetyZoneResponse{}, MapRepositoryError("safety zone", err)
-	}
-	// The revision module is the only path that may advance an active zone's
-	// version. While an unpublished draft exists, a direct update cannot be
-	// allowed to mutate the live zone; the draft, zone and published history
-	// must all stay untouched.
-	hasDraft, draftErr := service.revisions.HasOpenDraft(id)
-	if draftErr != nil {
-		return dto.SafetyZoneResponse{}, Internal("could not check revision draft", draftErr)
-	}
-	if hasDraft {
-		return dto.SafetyZoneResponse{}, Conflict("revision_draft_open", "an unpublished revision draft exists; publish or discard it before a direct update", repository.ErrStateConflict)
-	}
-	updated := before
-	updated.Name, updated.ZoneType, updated.PolygonGeoJSON = strings.TrimSpace(request.Name), request.ZoneType, string(request.PolygonGeoJSON)
-	updated.MinHeightMM, updated.MaxHeightMM, updated.SpeedLimitMMS = request.MinHeightMM, request.MaxHeightMM, request.SpeedLimitMMS
-	updated.AccessRule = strings.TrimSpace(request.AccessRule)
-	if err := service.repository.Update(&updated, request.Version); err != nil {
-		if errors.Is(err, repository.ErrVersionConflict) {
-			return dto.SafetyZoneResponse{}, Conflict("version_conflict", "zone version changed or the zone is inactive", err)
-		}
-		if repository.IsUniqueViolation(err) {
-			return dto.SafetyZoneResponse{}, Conflict("duplicate_zone_name", "zone name already exists in this cell", err)
-		}
-		return dto.SafetyZoneResponse{}, Internal("could not update safety zone", err)
-	}
-	after, err := service.repository.Get(id)
-	if err != nil {
-		return dto.SafetyZoneResponse{}, Internal("could not reload safety zone", err)
-	}
-	if err := service.system.RecordAudit(actor, requestID, "safety_zone.revised", "safety_zone", auditID(id), map[string]any{"expected_version": request.Version}, zoneSummary(before), zoneSummary(after)); err != nil {
-		return dto.SafetyZoneResponse{}, err
-	}
-	return zoneResponse(after), nil
+	_ = id
+	_ = request
+	_ = actor
+	_ = requestID
+	// Zone definition changes are accepted only through the revision publish
+	// entry, which produces a unique version and the impact list in one
+	// transaction. The legacy direct update is therefore permanently closed for
+	// every zone, whether or not a draft is open; the live zone, any draft and
+	// published revisions all stay untouched. Zone creation and the
+	// activate/deactivate state transitions remain available.
+	return dto.SafetyZoneResponse{}, Conflict("revision_publish_required", "safety-zone definition updates must be made through a published revision; the direct zone update path is disabled", repository.ErrStateConflict)
 }
 
 func (service *SafetyZoneService) Activate(id uint, version int, actor dto.Actor, requestID string) (dto.SafetyZoneResponse, error) {

@@ -1,7 +1,7 @@
 import { inject, Injectable, signal } from '@angular/core';
 import { finalize } from 'rxjs';
 import { SafetyZoneApi } from '../api/safety-zone';
-import { CreateSafetyZone, SafetyZone, UpdateSafetyZone } from '../types/safety-zone';
+import { CreateSafetyZone, SafetyZone } from '../types/safety-zone';
 import { apiErrorMessage } from '../utils/api-error';
 
 @Injectable({ providedIn: 'root' })
@@ -31,7 +31,6 @@ export class SafetyZoneStore {
 
   choose(zone: SafetyZone): void { this.selected.set(zone); }
   create(payload: CreateSafetyZone, done?: () => void): void { this.mutate(this.api.create(payload), done); }
-  update(id: number, payload: UpdateSafetyZone, done?: () => void): void { this.mutate(this.api.update(id, payload), done); }
   activate(zone: SafetyZone): void { this.mutate(this.api.activate(zone.id, zone.version)); }
   deactivate(zone: SafetyZone): void { this.mutate(this.api.deactivate(zone.id, zone.version)); }
 

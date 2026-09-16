@@ -83,9 +83,10 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 
 规则：
 
-- **每个区域至多一份未发布草案**：`zone_revisions` 对 `(safety_zone_id, open_draft_slot)` 建立部分唯一索引（已发布记录的槽位为 NULL）。重复保存草案是更新同一条，而不是新建。草案打开期间，旧的直接修订路径 `PUT /zones/:id` 会被拒绝并返回 409 `revision_draft_open`，活动区域、草案和已发布修订都保持原样；版本推进只能经发布入口完成。
+- **旧直接修订路径稳定关闭**：`PUT /zones/:id` 不再接受任何区域定义更新，无论是否存在草案都返回 409 `revision_publish_required`；区域、已有草案与已发布修订均保持原样。区域创建（`POST /zones`）和启用/停用状态切换（`activate`/`deactivate`）不受影响。所有定义变更只能由修订发布完成。
+- **每个区域至多一份未发布草案**：`zone_revisions` 对 `(safety_zone_id, open_draft_slot)` 建立部分唯一索引（已发布记录的槽位为 NULL）。重复保存草案是更新同一条，而不是新建。
 - **发布生成唯一新版本**：发布把修订定义条件化地复制到活动区域行并把 `version` 加一；`(safety_zone_id, published_version)` 唯一索引保证版本不重复，乐观版本不匹配返回 409。
-- **列出工作单元内受影响的活动程序**：发布时对同一工作单元的每个 `active` 运动程序，用修订后的区域重新做扩张包络求交，冻结逐条 `ZoneRevisionImpact`（是否受影响、接触次数、首次接触段与时刻、净距、实际/允许速度和判定依据）。
+- **列出工作单元内受影响的活动程序**：发布时对同一工作单元的每个 `active` 运动程序，用修订后的区域重新做扩张包络求交，冻结逐条 `ZoneRevisionImpact`（是否受影响、接触次数、首次接触段与时刻、净距、实际/允许速度和判定依据）。**工作单元没有活动程序时发布同样成功**，只是生成空影响清单。
 - **版本与影响清单一起落定**：区域版本推进、草案转已发布、影响清单写入、已接受校验标记全部在**同一个数据库事务**内完成；任一步失败整体回滚，草案保持未发布、区域版本不变、不留半截影响清单。
 - **已接受校验只标记待重评**：发布只会为受影响活动程序的 `accepted` 校验运行新增独立的 `validation_reevaluations` 标记；校验运行本身的状态、碰撞/联锁证据、风险分和输入哈希**保持不变且可随时回读**。已被早前修订标记过的运行不会重复标记。
 
@@ -205,7 +206,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 | GET/PUT | `/cells/:id` | 详情、草稿布局乐观锁更新 |
 | POST | `/cells/:id/freeze`、`deactivate` | 冻结或停用 |
 | GET/POST | `/zones` | 列表、区域创建 |
-| GET/PUT | `/zones/:id` | 详情、版本修订 |
+| GET | `/zones/:id` | 详情（`PUT` 定义更新已关闭，统一返回 409 `revision_publish_required`） |
 | POST | `/zones/:id/activate`、`deactivate` | 区域状态动作 |
 | GET | `/zones/:id/revisions`、`/revisions/draft`、`/revisions/:revisionId` | 修订历史、唯一未发布草案、已发布修订（含影响清单与重评标记） |
 | PUT/POST | `/zones/:id/revisions/draft`、`/revisions/publish` | 保存未发布草案、**唯一发布入口**（事务化落定版本与影响清单） |
@@ -217,7 +218,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 | POST | `/validations/:id/review`、`accept`、`void` | 人工处置 |
 | GET | `/audit` | 审计筛选 |
 
-健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`invalid_revision_geometry`、`version_conflict`、`state_conflict`、`draft_exists`、`draft_missing`、`revision_draft_open`、`forbidden` 和 `unauthorized`。
+健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`invalid_revision_geometry`、`version_conflict`、`state_conflict`、`draft_exists`、`draft_missing`、`revision_publish_required`、`forbidden` 和 `unauthorized`。
 
 ## 环境变量和端口
 

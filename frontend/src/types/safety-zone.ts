@@ -28,7 +28,3 @@ export interface CreateSafetyZone {
   speed_limit_mm_s: number;
   access_rule: string;
 }
-
-export interface UpdateSafetyZone extends Omit<CreateSafetyZone, 'robot_cell_id'> {
-  version: number;
-}

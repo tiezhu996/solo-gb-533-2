@@ -55,7 +55,7 @@ func newRevisionFixture(t *testing.T) revisionFixture {
 	validationRepo := repository.NewValidationRunRepository(db)
 	systemService := NewSystemService(systemRepo, "revision-unit-test-secret-0123456789", time.Hour)
 	svc := NewZoneRevisionService(db, revisionRepo, zoneRepo, programRepo, validationRepo, systemService)
-	zoneSvc := NewSafetyZoneService(zoneRepo, revisionRepo, cellRepo, systemService)
+	zoneSvc := NewSafetyZoneService(zoneRepo, cellRepo, systemService)
 
 	now := time.Now().UTC()
 	cell := model.RobotCell{
@@ -268,41 +268,65 @@ func TestPublishFailureRollsBackEverything(t *testing.T) {
 	}
 }
 
-func TestDirectZoneUpdateRejectedWhileDraftOpen(t *testing.T) {
+func TestDirectZoneUpdateAlwaysRejected(t *testing.T) {
 	fixture := newRevisionFixture(t)
 	actor := dto.Actor{ID: 1, Username: "engineer", Role: constants.RoleSafetyEngineer}
-
-	draft, err := fixture.service.SaveDraft(fixture.zone.ID, gateDraftRequest(), actor, "req-1")
-	if err != nil {
-		t.Fatalf("save draft: %v", err)
-	}
 	direct := dto.UpdateSafetyZoneRequest{
 		Name: "Hijacked by direct PUT", ZoneType: constants.ZoneTypeRestricted,
 		PolygonGeoJSON: []byte(polygonGate()), MinHeightMM: 0, MaxHeightMM: 2400,
 		SpeedLimitMMS: 90, AccessRule: "bypassed revision entry", Version: fixture.zone.Version,
 	}
-	if _, err := fixture.zoneService.Update(fixture.zone.ID, direct, actor, "req-direct"); err == nil {
-		t.Fatal("expected direct zone update to be rejected while a revision draft is open")
-	} else {
-		var appError *AppError
-		if !errors.As(err, &appError) || appError.Code != "revision_draft_open" {
-			t.Fatalf("expected revision_draft_open conflict, got %v", err)
+	assertRejected := func(label string) {
+		t.Helper()
+		if _, err := fixture.zoneService.Update(fixture.zone.ID, direct, actor, "req-direct-"+label); err == nil {
+			t.Fatalf("%s: expected direct zone update to be rejected", label)
+		} else {
+			var appError *AppError
+			if !errors.As(err, &appError) || appError.Code != "revision_publish_required" {
+				t.Fatalf("%s: expected revision_publish_required conflict, got %v", label, err)
+			}
+		}
+		liveZone, err := fixture.zones.Get(fixture.zone.ID)
+		if err != nil {
+			t.Fatalf("%s: reload zone: %v", label, err)
+		}
+		if liveZone.Version != fixture.zone.Version || liveZone.Name != fixture.zone.Name || liveZone.ZoneType != fixture.zone.ZoneType {
+			t.Fatalf("%s: live zone changed after rejected direct update: %+v", label, liveZone)
 		}
 	}
 
-	// Live zone unchanged.
-	liveZone, err := fixture.zones.Get(fixture.zone.ID)
+	// Rejected even with no draft open.
+	assertRejected("no-draft")
+
+	// Creation remains available.
+	createRequest := dto.CreateSafetyZoneRequest{
+		RobotCellID: fixture.zone.RobotCellID, Name: "Newly created zone", ZoneType: constants.ZoneTypeEscape,
+		PolygonGeoJSON: []byte(polygonGate()), MinHeightMM: 0, MaxHeightMM: 2000,
+		SpeedLimitMMS: 200, AccessRule: "escape route kept clear",
+	}
+	created, err := fixture.zoneService.Create(createRequest, actor, "req-create")
 	if err != nil {
-		t.Fatalf("reload zone: %v", err)
-	}
-	if liveZone.Version != fixture.zone.Version {
-		t.Fatalf("live zone version changed to %d; must stay %d", liveZone.Version, fixture.zone.Version)
-	}
-	if liveZone.Name != fixture.zone.Name || liveZone.ZoneType != fixture.zone.ZoneType {
-		t.Fatalf("live zone definition was modified by the rejected direct update")
+		t.Fatalf("zone creation must remain available: %v", err)
 	}
 
-	// Open draft unchanged.
+	// State transitions remain available (deactivate the fresh zone).
+	if _, err := fixture.zoneService.Deactivate(created.ID, created.Version, actor, "req-deactivate"); err != nil {
+		t.Fatalf("zone deactivate must remain available: %v", err)
+	}
+	deactivated, err := fixture.zones.Get(created.ID)
+	if err != nil {
+		t.Fatalf("reload created zone: %v", err)
+	}
+	if deactivated.ZoneState != constants.ZoneStateInactive {
+		t.Fatalf("expected created zone to be inactive, got %s", deactivated.ZoneState)
+	}
+
+	// Rejected again while a draft exists; the draft and published history stay put.
+	draft, err := fixture.service.SaveDraft(fixture.zone.ID, gateDraftRequest(), actor, "req-1")
+	if err != nil {
+		t.Fatalf("save draft: %v", err)
+	}
+	assertRejected("draft-open")
 	openDraft, err := fixture.service.Get(draft.ID)
 	if err != nil {
 		t.Fatalf("read draft: %v", err)
@@ -310,8 +334,6 @@ func TestDirectZoneUpdateRejectedWhileDraftOpen(t *testing.T) {
 	if openDraft.RevisionStatus != constants.RevisionStatusDraft || openDraft.Name != gateDraftRequest().Name {
 		t.Fatalf("open draft was modified: %+v", openDraft)
 	}
-
-	// No published revision must exist for the zone.
 	var publishedCount int64
 	if err := fixture.db.Model(&model.ZoneRevision{}).
 		Where("safety_zone_id = ? AND revision_status = ?", fixture.zone.ID, constants.RevisionStatusPublished).
@@ -320,6 +342,65 @@ func TestDirectZoneUpdateRejectedWhileDraftOpen(t *testing.T) {
 	}
 	if publishedCount != 0 {
 		t.Fatalf("expected no published revisions, got %d", publishedCount)
+	}
+}
+
+func TestPublishWithNoActiveProgramsProducesEmptyImpacts(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	actor := dto.Actor{ID: 1, Username: "engineer", Role: constants.RoleSafetyEngineer}
+	now := time.Now().UTC()
+	emptyCell := model.RobotCell{
+		CellCode: "CELL-EMPTY", Name: "No programs yet", LayoutGeoJSON: `{"type":"FeatureCollection","features":[]}`,
+		RobotModel: "R", ControllerModel: "C", MaxReachMM: 2700, OwnerTeam: "Team",
+		CellState: constants.CellStateFrozen, LayoutVersion: 1, CreatedBy: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.db.Create(&emptyCell).Error; err != nil {
+		t.Fatalf("create empty cell: %v", err)
+	}
+	emptyZone := model.SafetyZone{
+		RobotCellID: emptyCell.ID, Name: "Lone zone", ZoneType: constants.ZoneTypeOperating,
+		PolygonGeoJSON: polygonSquare(), MinHeightMM: 0, MaxHeightMM: 2200, SpeedLimitMMS: 1500,
+		AccessRule: "guards closed", ZoneState: constants.ZoneStateActive, Version: 1,
+		CreatedBy: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.db.Create(&emptyZone).Error; err != nil {
+		t.Fatalf("create lone zone: %v", err)
+	}
+	request := dto.SaveZoneRevisionDraftRequest{
+		Name: "Lone zone expanded", ZoneType: constants.ZoneTypeRestricted,
+		PolygonGeoJSON: []byte(polygonGate()), MinHeightMM: 0, MaxHeightMM: 2400,
+		SpeedLimitMMS: 250, AccessRule: "gate interlock required",
+	}
+	if _, err := fixture.service.SaveDraft(emptyZone.ID, request, actor, "req-1"); err != nil {
+		t.Fatalf("save draft: %v", err)
+	}
+	published, err := fixture.service.Publish(emptyZone.ID, dto.PublishZoneRevisionRequest{}, actor, "req-2")
+	if err != nil {
+		t.Fatalf("publish with zero active programs must succeed, got %v", err)
+	}
+	if published.PublishedVersion == nil || *published.PublishedVersion != emptyZone.Version+1 {
+		t.Fatalf("expected unique new version %d, got %v", emptyZone.Version+1, published.PublishedVersion)
+	}
+	if len(published.Impacts) != 0 {
+		t.Fatalf("expected empty impact list, got %d entries", len(published.Impacts))
+	}
+	if len(published.ReevaluationFlags) != 0 {
+		t.Fatalf("expected no re-evaluation flags, got %d", len(published.ReevaluationFlags))
+	}
+	liveZone, err := fixture.zones.Get(emptyZone.ID)
+	if err != nil {
+		t.Fatalf("reload zone: %v", err)
+	}
+	if liveZone.Version != emptyZone.Version+1 || liveZone.ZoneType != constants.ZoneTypeRestricted {
+		t.Fatalf("live zone did not take the published revision: %+v", liveZone)
+	}
+	// The frozen impact list reads back empty.
+	reRead, err := fixture.service.GetForZone(emptyZone.ID, published.ID)
+	if err != nil {
+		t.Fatalf("re-read published revision: %v", err)
+	}
+	if reRead.RevisionStatus != constants.RevisionStatusPublished || len(reRead.Impacts) != 0 {
+		t.Fatalf("published revision read back incorrectly: %+v", reRead)
 	}
 }
 

@@ -51,18 +51,6 @@ func (repository *ZoneRevisionRepository) OpenDraft(zoneID uint) (model.ZoneRevi
 	return revision, nil
 }
 
-// HasOpenDraft reports whether the zone currently holds an unpublished
-// revision draft. Such a zone must reject direct updates so the version and
-// impact list can only be produced through the publish entry.
-func (repository *ZoneRevisionRepository) HasOpenDraft(zoneID uint) (bool, error) {
-	var count int64
-	if err := repository.db.Model(&model.ZoneRevision{}).
-		Where("safety_zone_id = ? AND revision_status = ?", zoneID, "draft").Count(&count).Error; err != nil {
-		return false, fmt.Errorf("count open zone revision: %w", err)
-	}
-	return count > 0, nil
-}
-
 func (repository *ZoneRevisionRepository) Get(id uint) (model.ZoneRevision, error) {
 	var revision model.ZoneRevision
 	if err := repository.db.Preload("SafetyZone").Preload("SafetyZone.RobotCell").First(&revision, id).Error; err != nil {

@@ -60,24 +60,6 @@ func (repository *SafetyZoneRepository) ActiveForCell(cellID uint) ([]model.Safe
 	return zones, nil
 }
 
-func (repository *SafetyZoneRepository) Update(zone *model.SafetyZone, expectedVersion int) error {
-	result := repository.db.Model(&model.SafetyZone{}).
-		Where("id = ? AND version = ? AND zone_state <> ?", zone.ID, expectedVersion, "inactive").
-		Updates(map[string]any{
-			"name": zone.Name, "zone_type": zone.ZoneType, "polygon_geo_json": zone.PolygonGeoJSON,
-			"min_height_mm": zone.MinHeightMM, "max_height_mm": zone.MaxHeightMM,
-			"speed_limit_mm_s": zone.SpeedLimitMMS, "access_rule": zone.AccessRule,
-			"version": expectedVersion + 1, "zone_state": "draft",
-		})
-	if result.Error != nil {
-		return fmt.Errorf("update safety zone: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return ErrVersionConflict
-	}
-	return nil
-}
-
 func (repository *SafetyZoneRepository) Transition(id uint, version int, from, to string) error {
 	result := repository.db.Model(&model.SafetyZone{}).
 		Where("id = ? AND version = ? AND zone_state = ?", id, version, from).
