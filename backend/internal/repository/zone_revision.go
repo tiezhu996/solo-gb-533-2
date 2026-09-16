@@ -51,10 +51,33 @@ func (repository *ZoneRevisionRepository) OpenDraft(zoneID uint) (model.ZoneRevi
 	return revision, nil
 }
 
+// HasOpenDraft reports whether the zone currently holds an unpublished
+// revision draft. Such a zone must reject direct updates so the version and
+// impact list can only be produced through the publish entry.
+func (repository *ZoneRevisionRepository) HasOpenDraft(zoneID uint) (bool, error) {
+	var count int64
+	if err := repository.db.Model(&model.ZoneRevision{}).
+		Where("safety_zone_id = ? AND revision_status = ?", zoneID, "draft").Count(&count).Error; err != nil {
+		return false, fmt.Errorf("count open zone revision: %w", err)
+	}
+	return count > 0, nil
+}
+
 func (repository *ZoneRevisionRepository) Get(id uint) (model.ZoneRevision, error) {
 	var revision model.ZoneRevision
 	if err := repository.db.Preload("SafetyZone").Preload("SafetyZone.RobotCell").First(&revision, id).Error; err != nil {
 		return revision, fmt.Errorf("get zone revision: %w", err)
+	}
+	return revision, nil
+}
+
+// GetForZone returns a revision by id, requiring it to belong to the given
+// zone, so a revision id from another work-zone path cannot be read here.
+func (repository *ZoneRevisionRepository) GetForZone(zoneID, revisionID uint) (model.ZoneRevision, error) {
+	var revision model.ZoneRevision
+	if err := repository.db.Preload("SafetyZone").Preload("SafetyZone.RobotCell").
+		Where("id = ? AND safety_zone_id = ?", revisionID, zoneID).First(&revision).Error; err != nil {
+		return revision, fmt.Errorf("get zone revision for zone: %w", err)
 	}
 	return revision, nil
 }

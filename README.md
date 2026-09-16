@@ -83,7 +83,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 
 规则：
 
-- **每个区域至多一份未发布草案**：`zone_revisions` 对 `(safety_zone_id, open_draft_slot)` 建立部分唯一索引（已发布记录的槽位为 NULL）。重复保存草案是更新同一条，而不是新建。
+- **每个区域至多一份未发布草案**：`zone_revisions` 对 `(safety_zone_id, open_draft_slot)` 建立部分唯一索引（已发布记录的槽位为 NULL）。重复保存草案是更新同一条，而不是新建。草案打开期间，旧的直接修订路径 `PUT /zones/:id` 会被拒绝并返回 409 `revision_draft_open`，活动区域、草案和已发布修订都保持原样；版本推进只能经发布入口完成。
 - **发布生成唯一新版本**：发布把修订定义条件化地复制到活动区域行并把 `version` 加一；`(safety_zone_id, published_version)` 唯一索引保证版本不重复，乐观版本不匹配返回 409。
 - **列出工作单元内受影响的活动程序**：发布时对同一工作单元的每个 `active` 运动程序，用修订后的区域重新做扩张包络求交，冻结逐条 `ZoneRevisionImpact`（是否受影响、接触次数、首次接触段与时刻、净距、实际/允许速度和判定依据）。
 - **版本与影响清单一起落定**：区域版本推进、草案转已发布、影响清单写入、已接受校验标记全部在**同一个数据库事务**内完成；任一步失败整体回滚，草案保持未发布、区域版本不变、不留半截影响清单。
@@ -217,7 +217,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 | POST | `/validations/:id/review`、`accept`、`void` | 人工处置 |
 | GET | `/audit` | 审计筛选 |
 
-健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`invalid_revision_geometry`、`version_conflict`、`state_conflict`、`draft_exists`、`draft_missing`、`forbidden` 和 `unauthorized`。
+健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`invalid_revision_geometry`、`version_conflict`、`state_conflict`、`draft_exists`、`draft_missing`、`revision_draft_open`、`forbidden` 和 `unauthorized`。
 
 ## 环境变量和端口
 

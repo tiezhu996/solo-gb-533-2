@@ -133,6 +133,17 @@ func (service *ZoneRevisionService) Get(id uint) (dto.ZoneRevisionResponse, erro
 	return service.assemble(revision)
 }
 
+// GetForZone resolves a revision by its own revision id while confirming it
+// belongs to the zone in the path. The zone id must never be mistaken for the
+// revision id.
+func (service *ZoneRevisionService) GetForZone(zoneID, revisionID uint) (dto.ZoneRevisionResponse, error) {
+	revision, err := service.revisions.GetForZone(zoneID, revisionID)
+	if err != nil {
+		return dto.ZoneRevisionResponse{}, MapRepositoryError("zone revision", err)
+	}
+	return service.assemble(revision)
+}
+
 // Publish is the sole finalization entry. The zone version bump, impact list
 // and re-evaluation flags commit in one database transaction; any failure rolls
 // the entire operation back.

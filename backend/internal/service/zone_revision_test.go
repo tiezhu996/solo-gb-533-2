@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 type revisionFixture struct {
 	db          *gorm.DB
 	service     *ZoneRevisionService
+	zoneService *SafetyZoneService
 	zones       *repository.SafetyZoneRepository
 	validations *repository.ValidationRunRepository
 	zone        model.SafetyZone
@@ -46,12 +48,14 @@ func newRevisionFixture(t *testing.T) revisionFixture {
 		t.Fatalf("migrate: %v", err)
 	}
 	systemRepo := repository.NewSystemRepository(db)
+	cellRepo := repository.NewRobotCellRepository(db)
 	zoneRepo := repository.NewSafetyZoneRepository(db)
 	revisionRepo := repository.NewZoneRevisionRepository(db)
 	programRepo := repository.NewMotionProgramRepository(db)
 	validationRepo := repository.NewValidationRunRepository(db)
 	systemService := NewSystemService(systemRepo, "revision-unit-test-secret-0123456789", time.Hour)
 	svc := NewZoneRevisionService(db, revisionRepo, zoneRepo, programRepo, validationRepo, systemService)
+	zoneSvc := NewSafetyZoneService(zoneRepo, revisionRepo, cellRepo, systemService)
 
 	now := time.Now().UTC()
 	cell := model.RobotCell{
@@ -101,7 +105,7 @@ func newRevisionFixture(t *testing.T) revisionFixture {
 		t.Fatalf("create accepted run: %v", err)
 	}
 	return revisionFixture{
-		db: db, service: svc, zones: zoneRepo, validations: validationRepo,
+		db: db, service: svc, zoneService: zoneSvc, zones: zoneRepo, validations: validationRepo,
 		zone: zone, programA: programA, programB: programB, accepted: accepted,
 	}
 }
@@ -261,5 +265,123 @@ func TestPublishFailureRollsBackEverything(t *testing.T) {
 	}
 	if impactCount != 0 || flagCount != 0 {
 		t.Fatalf("rollback left %d impacts and %d flags", impactCount, flagCount)
+	}
+}
+
+func TestDirectZoneUpdateRejectedWhileDraftOpen(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	actor := dto.Actor{ID: 1, Username: "engineer", Role: constants.RoleSafetyEngineer}
+
+	draft, err := fixture.service.SaveDraft(fixture.zone.ID, gateDraftRequest(), actor, "req-1")
+	if err != nil {
+		t.Fatalf("save draft: %v", err)
+	}
+	direct := dto.UpdateSafetyZoneRequest{
+		Name: "Hijacked by direct PUT", ZoneType: constants.ZoneTypeRestricted,
+		PolygonGeoJSON: []byte(polygonGate()), MinHeightMM: 0, MaxHeightMM: 2400,
+		SpeedLimitMMS: 90, AccessRule: "bypassed revision entry", Version: fixture.zone.Version,
+	}
+	if _, err := fixture.zoneService.Update(fixture.zone.ID, direct, actor, "req-direct"); err == nil {
+		t.Fatal("expected direct zone update to be rejected while a revision draft is open")
+	} else {
+		var appError *AppError
+		if !errors.As(err, &appError) || appError.Code != "revision_draft_open" {
+			t.Fatalf("expected revision_draft_open conflict, got %v", err)
+		}
+	}
+
+	// Live zone unchanged.
+	liveZone, err := fixture.zones.Get(fixture.zone.ID)
+	if err != nil {
+		t.Fatalf("reload zone: %v", err)
+	}
+	if liveZone.Version != fixture.zone.Version {
+		t.Fatalf("live zone version changed to %d; must stay %d", liveZone.Version, fixture.zone.Version)
+	}
+	if liveZone.Name != fixture.zone.Name || liveZone.ZoneType != fixture.zone.ZoneType {
+		t.Fatalf("live zone definition was modified by the rejected direct update")
+	}
+
+	// Open draft unchanged.
+	openDraft, err := fixture.service.Get(draft.ID)
+	if err != nil {
+		t.Fatalf("read draft: %v", err)
+	}
+	if openDraft.RevisionStatus != constants.RevisionStatusDraft || openDraft.Name != gateDraftRequest().Name {
+		t.Fatalf("open draft was modified: %+v", openDraft)
+	}
+
+	// No published revision must exist for the zone.
+	var publishedCount int64
+	if err := fixture.db.Model(&model.ZoneRevision{}).
+		Where("safety_zone_id = ? AND revision_status = ?", fixture.zone.ID, constants.RevisionStatusPublished).
+		Count(&publishedCount).Error; err != nil {
+		t.Fatalf("count published: %v", err)
+	}
+	if publishedCount != 0 {
+		t.Fatalf("expected no published revisions, got %d", publishedCount)
+	}
+}
+
+func TestGetForZoneReadsByRevisionID(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	actor := dto.Actor{ID: 1, Username: "engineer", Role: constants.RoleSafetyEngineer}
+
+	// A second zone makes its zone id differ from the first revision's own id,
+	// which is the case that exposed the zone-id/revision-id confusion.
+	secondZone := model.SafetyZone{
+		RobotCellID: fixture.zone.RobotCellID, Name: "Second envelope", ZoneType: constants.ZoneTypeService,
+		PolygonGeoJSON: polygonSquare(), MinHeightMM: 0, MaxHeightMM: 2000, SpeedLimitMMS: 0,
+		AccessRule: "service only", ZoneState: constants.ZoneStateActive, Version: 1,
+		CreatedBy: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := fixture.db.Create(&secondZone).Error; err != nil {
+		t.Fatalf("create second zone: %v", err)
+	}
+
+	request := dto.SaveZoneRevisionDraftRequest{
+		Name: "Second envelope revised", ZoneType: constants.ZoneTypeService,
+		PolygonGeoJSON: []byte(polygonGate()), MinHeightMM: 0, MaxHeightMM: 2000,
+		SpeedLimitMMS: 0, AccessRule: "service only revised",
+	}
+	draft, err := fixture.service.SaveDraft(secondZone.ID, request, actor, "req-1")
+	if err != nil {
+		t.Fatalf("save draft on second zone: %v", err)
+	}
+	if draft.ID == secondZone.ID {
+		t.Fatalf("revision id %d must differ from zone id %d for this test", draft.ID, secondZone.ID)
+	}
+
+	// Reading with the revision's own id, scoped to its zone, works.
+	byRevisionID, err := fixture.service.GetForZone(secondZone.ID, draft.ID)
+	if err != nil {
+		t.Fatalf("get revision by its own id: %v", err)
+	}
+	if byRevisionID.ID != draft.ID || byRevisionID.SafetyZoneID != secondZone.ID {
+		t.Fatalf("returned wrong revision: %+v", byRevisionID)
+	}
+
+	// Passing the zone id where the revision id belongs must not return it.
+	if _, err := fixture.service.GetForZone(secondZone.ID, secondZone.ID); err == nil {
+		t.Fatal("using the zone id as the revision id must not return a revision")
+	}
+
+	// The revision is not readable through the other zone even though its
+	// revision id is valid globally.
+	if _, err := fixture.service.GetForZone(fixture.zone.ID, draft.ID); err == nil {
+		t.Fatal("revision must not be readable scoped to a different zone")
+	}
+
+	// After publish the same revision id reads back as published.
+	published, err := fixture.service.Publish(secondZone.ID, dto.PublishZoneRevisionRequest{}, actor, "req-2")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	reRead, err := fixture.service.GetForZone(secondZone.ID, published.ID)
+	if err != nil {
+		t.Fatalf("re-read published revision: %v", err)
+	}
+	if reRead.RevisionStatus != constants.RevisionStatusPublished || reRead.PublishedVersion == nil {
+		t.Fatalf("published revision read back incorrectly: %+v", reRead)
 	}
 }

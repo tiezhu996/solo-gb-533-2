@@ -14,12 +14,13 @@ import (
 
 type SafetyZoneService struct {
 	repository *repository.SafetyZoneRepository
+	revisions  *repository.ZoneRevisionRepository
 	cells      *repository.RobotCellRepository
 	system     *SystemService
 }
 
-func NewSafetyZoneService(repository *repository.SafetyZoneRepository, cells *repository.RobotCellRepository, system *SystemService) *SafetyZoneService {
-	return &SafetyZoneService{repository: repository, cells: cells, system: system}
+func NewSafetyZoneService(repository *repository.SafetyZoneRepository, revisions *repository.ZoneRevisionRepository, cells *repository.RobotCellRepository, system *SystemService) *SafetyZoneService {
+	return &SafetyZoneService{repository: repository, revisions: revisions, cells: cells, system: system}
 }
 
 func (service *SafetyZoneService) Create(request dto.CreateSafetyZoneRequest, actor dto.Actor, requestID string) (dto.SafetyZoneResponse, error) {
@@ -78,6 +79,17 @@ func (service *SafetyZoneService) Update(id uint, request dto.UpdateSafetyZoneRe
 	before, err := service.repository.Get(id)
 	if err != nil {
 		return dto.SafetyZoneResponse{}, MapRepositoryError("safety zone", err)
+	}
+	// The revision module is the only path that may advance an active zone's
+	// version. While an unpublished draft exists, a direct update cannot be
+	// allowed to mutate the live zone; the draft, zone and published history
+	// must all stay untouched.
+	hasDraft, draftErr := service.revisions.HasOpenDraft(id)
+	if draftErr != nil {
+		return dto.SafetyZoneResponse{}, Internal("could not check revision draft", draftErr)
+	}
+	if hasDraft {
+		return dto.SafetyZoneResponse{}, Conflict("revision_draft_open", "an unpublished revision draft exists; publish or discard it before a direct update", repository.ErrStateConflict)
 	}
 	updated := before
 	updated.Name, updated.ZoneType, updated.PolygonGeoJSON = strings.TrimSpace(request.Name), request.ZoneType, string(request.PolygonGeoJSON)

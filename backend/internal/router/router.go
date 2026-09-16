@@ -56,7 +56,7 @@ func wire(db *gorm.DB, cfg config.Config) handlers {
 	validationRepository := repository.NewValidationRunRepository(db)
 	systemService := service.NewSystemService(systemRepository, cfg.JWTSecret, cfg.JWTTTL)
 	cellService := service.NewRobotCellService(cellRepository, systemService)
-	zoneService := service.NewSafetyZoneService(zoneRepository, cellRepository, systemService)
+	zoneService := service.NewSafetyZoneService(zoneRepository, revisionRepository, cellRepository, systemService)
 	revisionService := service.NewZoneRevisionService(db, revisionRepository, zoneRepository, programRepository, validationRepository, systemService)
 	programService := service.NewMotionProgramService(db, programRepository, cellRepository, systemService)
 	validationService := service.NewValidationRunService(db, validationRepository, programRepository, zoneRepository, systemService, cfg.AlgorithmVersion)

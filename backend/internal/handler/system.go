@@ -132,7 +132,11 @@ func Pagination(context *gin.Context) (int, int) {
 }
 
 func PathID(context *gin.Context) (uint, error) {
-	value, err := strconv.ParseUint(context.Param("id"), 10, 32)
+	return PathParamID(context, "id")
+}
+
+func PathParamID(context *gin.Context, name string) (uint, error) {
+	value, err := strconv.ParseUint(context.Param(name), 10, 32)
 	if err != nil || value == 0 {
 		return 0, service.BadRequest("invalid_id", "path id must be a positive integer")
 	}

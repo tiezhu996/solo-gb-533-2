@@ -82,12 +82,17 @@ func (handler *ZoneRevisionHandler) Publish(context *gin.Context) {
 }
 
 func (handler *ZoneRevisionHandler) Get(context *gin.Context) {
-	id, err := PathID(context)
+	zoneID, err := PathID(context)
 	if err != nil {
 		WriteError(context, err)
 		return
 	}
-	item, err := handler.service.Get(id)
+	revisionID, err := PathParamID(context, "revisionId")
+	if err != nil {
+		WriteError(context, err)
+		return
+	}
+	item, err := handler.service.GetForZone(zoneID, revisionID)
 	if err != nil {
 		WriteError(context, err)
 		return
