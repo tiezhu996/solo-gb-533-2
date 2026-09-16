@@ -10,10 +10,34 @@ import (
 
 type ZoneRevisionRepository struct{ db *gorm.DB }
 
+// RevisionTxStore is the transaction-scoped revision persistence contract used
+// while publishing a revision. The concrete repository satisfies it.
+type RevisionTxStore interface {
+	ApplyRevisionToZone(zoneID uint, expectedVersion, newVersion int, revision model.ZoneRevision) error
+	Publish(id uint, baseVersion, publishedVersion int, publishedAt any) error
+	CreateImpact(impact *model.ZoneRevisionImpact) error
+	CreateReevaluation(flag *model.ValidationReevaluation) error
+	ExistingReevaluationFlag(validationRunID uint) (model.ValidationReevaluation, error)
+}
+
+// RevisionStore is the full revision persistence seam used by the revision
+// service. WithDB returns a store bound to one transaction.
+type RevisionStore interface {
+	Create(revision *model.ZoneRevision) error
+	Update(revision *model.ZoneRevision) error
+	OpenDraft(zoneID uint) (model.ZoneRevision, error)
+	Get(id uint) (model.ZoneRevision, error)
+	GetForZone(zoneID, revisionID uint) (model.ZoneRevision, error)
+	ListByZone(zoneID uint) ([]model.ZoneRevision, error)
+	Impacts(revisionID uint) ([]model.ZoneRevisionImpact, error)
+	ReevaluationFlags(revisionID uint) ([]model.ValidationReevaluation, error)
+	WithDB(tx *gorm.DB) RevisionTxStore
+}
+
 func NewZoneRevisionRepository(db *gorm.DB) *ZoneRevisionRepository {
 	return &ZoneRevisionRepository{db: db}
 }
-func (repository *ZoneRevisionRepository) WithDB(db *gorm.DB) *ZoneRevisionRepository {
+func (repository *ZoneRevisionRepository) WithDB(db *gorm.DB) RevisionTxStore {
 	return &ZoneRevisionRepository{db: db}
 }
 

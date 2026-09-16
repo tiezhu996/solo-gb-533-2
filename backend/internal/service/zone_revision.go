@@ -23,50 +23,15 @@ import (
 // flags previously accepted validations for re-evaluation.
 type ZoneRevisionService struct {
 	db          *gorm.DB
-	revisions   *repository.ZoneRevisionRepository
+	revisions   repository.RevisionStore
 	zones       *repository.SafetyZoneRepository
 	programs    *repository.MotionProgramRepository
 	validations *repository.ValidationRunRepository
 	system      *SystemService
-	// faultAtStage is zero outside tests. When set to a publish stage, Publish
-	// aborts that stage inside the transaction so the failure (and its stage)
-	// can be exercised deterministically.
-	faultAtStage string
 }
 
-// Publish stages, named so an injected or real failure can be attributed.
-const (
-	stageLoadActivePrograms = "load_active_programs"
-	stageApplyZoneVersion   = "apply_zone_version"
-	stagePublishDraft       = "publish_draft"
-	stagePersistImpacts     = "persist_impacts"
-	stagePersistReevalFlags = "persist_reevaluation_flags"
-	stageRecordPublishAudit = "record_publish_audit"
-)
-
-// revisionPublishError identifies the publish stage at which a failure was
-// injected. It always occurs inside the transaction and therefore forces a
-// full rollback.
-type revisionPublishError struct{ stage string }
-
-func (err *revisionPublishError) Error() string {
-	return "injected failure at publish stage: " + err.stage
-}
-func (err *revisionPublishError) Stage() string { return err.stage }
-
-func NewZoneRevisionService(db *gorm.DB, revisions *repository.ZoneRevisionRepository, zones *repository.SafetyZoneRepository, programs *repository.MotionProgramRepository, validations *repository.ValidationRunRepository, system *SystemService) *ZoneRevisionService {
+func NewZoneRevisionService(db *gorm.DB, revisions repository.RevisionStore, zones *repository.SafetyZoneRepository, programs *repository.MotionProgramRepository, validations *repository.ValidationRunRepository, system *SystemService) *ZoneRevisionService {
 	return &ZoneRevisionService{db: db, revisions: revisions, zones: zones, programs: programs, validations: validations, system: system}
-}
-
-// setFaultAtStage injects a failure at one named publish stage. Test-only: the
-// production constructor leaves it empty and the hook is a no-op.
-func (service *ZoneRevisionService) setFaultAtStage(stage string) { service.faultAtStage = stage }
-
-func (service *ZoneRevisionService) faultHook(stage string) error {
-	if service.faultAtStage == stage {
-		return &revisionPublishError{stage: stage}
-	}
-	return nil
 }
 
 func (service *ZoneRevisionService) SaveDraft(zoneID uint, request dto.SaveZoneRevisionDraftRequest, actor dto.Actor, requestID string) (dto.ZoneRevisionResponse, error) {
@@ -209,9 +174,6 @@ func (service *ZoneRevisionService) Publish(zoneID uint, request dto.PublishZone
 		txPrograms := service.programs.WithDB(tx)
 		txValidations := service.validations.WithDB(tx)
 
-		if txErr := service.faultHook(stageLoadActivePrograms); txErr != nil {
-			return txErr
-		}
 		activePrograms, txErr := txPrograms.ActiveForCell(zone.RobotCellID)
 		if txErr != nil {
 			return txErr
@@ -236,13 +198,7 @@ func (service *ZoneRevisionService) Publish(zoneID uint, request dto.PublishZone
 
 		// Version and impact list are fixed together: the conditional zone
 		// update and draft publish must both succeed in this transaction.
-		if txErr := service.faultHook(stageApplyZoneVersion); txErr != nil {
-			return txErr
-		}
 		if txErr := txRevisions.ApplyRevisionToZone(zoneID, zone.Version, newVersion, draft); txErr != nil {
-			return txErr
-		}
-		if txErr := service.faultHook(stagePublishDraft); txErr != nil {
 			return txErr
 		}
 		if txErr := txRevisions.Publish(draft.ID, draft.BaseVersion, newVersion, publishedAt); txErr != nil {
@@ -252,20 +208,10 @@ func (service *ZoneRevisionService) Publish(zoneID uint, request dto.PublishZone
 			if txErr := txRevisions.CreateImpact(&impacts[index]); txErr != nil {
 				return txErr
 			}
-			// Injectable failure point: the first impact row has already been
-			// written in this transaction, so a rollback here must discard it.
-			if index == 0 {
-				if txErr := service.faultHook(stagePersistImpacts); txErr != nil {
-					return txErr
-				}
-			}
 		}
 
 		acceptedRuns, txErr := txValidations.AcceptedForPrograms(affectedProgramIDs)
 		if txErr != nil {
-			return txErr
-		}
-		if txErr := service.faultHook(stagePersistReevalFlags); txErr != nil {
 			return txErr
 		}
 		for _, run := range acceptedRuns {
@@ -292,9 +238,6 @@ func (service *ZoneRevisionService) Publish(zoneID uint, request dto.PublishZone
 			"zone_version": newVersion, "affected_active_programs": len(affectedProgramIDs),
 			"accepted_validations_flagged": len(acceptedRuns),
 		}
-		if txErr := service.faultHook(stageRecordPublishAudit); txErr != nil {
-			return txErr
-		}
 		return service.system.RecordAuditTx(tx, actor, requestID, "zone_revision.published", "zone_revision", auditID(draft.ID), map[string]any{"safety_zone_id": zoneID, "new_version": newVersion}, revisionDraftSummary(draft), afterSummary)
 	})
 	if err != nil {
@@ -307,10 +250,6 @@ func (service *ZoneRevisionService) Publish(zoneID uint, request dto.PublishZone
 		var appError *AppError
 		if errors.As(err, &appError) {
 			return dto.ZoneRevisionResponse{}, appError
-		}
-		var injected *revisionPublishError
-		if errors.As(err, &injected) {
-			return dto.ZoneRevisionResponse{}, Internal("zone revision publish failed at stage "+injected.Stage()+"; all changes were rolled back", err)
 		}
 		return dto.ZoneRevisionResponse{}, Internal("could not publish zone revision", err)
 	}

@@ -3,7 +3,6 @@ package service
 import (
 	"errors"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,20 +21,21 @@ import (
 // timeout so two goroutines genuinely contend on the same rows; there are no
 // in-memory doubles and the test never serializes the publishes.
 type persistentRevisionStack struct {
-	db       *gorm.DB
-	path     string
-	service  *ZoneRevisionService
-	revision *repository.ZoneRevisionRepository
-	zone     *repository.SafetyZoneRepository
+	db      *gorm.DB
+	path    string
+	service *ZoneRevisionService
+	zone    *repository.SafetyZoneRepository
 }
 
 func persistentDSN(path string) string {
 	return path + "?_journal_mode=WAL&_busy_timeout=10000&_txlock=immediate"
 }
 
-func openPersistentStack(t *testing.T) persistentRevisionStack {
+// buildStack opens the file-backed database and wires the service. The revision
+// store factory is the only test seam: the concurrency test passes the real
+// repository straight through, while the fault test wraps that repository.
+func buildStack(t *testing.T, path string, storeFactory func(db *gorm.DB, real repository.RevisionStore) repository.RevisionStore) (*gorm.DB, string, *ZoneRevisionService) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "revision-concurrency.db")
 	db, err := gorm.Open(sqlite.Open(persistentDSN(path)), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open file sqlite: %v", err)
@@ -54,12 +54,24 @@ func openPersistentStack(t *testing.T) persistentRevisionStack {
 	}
 	systemRepo := repository.NewSystemRepository(db)
 	zoneRepo := repository.NewSafetyZoneRepository(db)
-	revisionRepo := repository.NewZoneRevisionRepository(db)
+	realRevisionRepo := repository.NewZoneRevisionRepository(db)
+	var revisionStore repository.RevisionStore = realRevisionRepo
+	if storeFactory != nil {
+		revisionStore = storeFactory(db, realRevisionRepo)
+	}
 	programRepo := repository.NewMotionProgramRepository(db)
 	validationRepo := repository.NewValidationRunRepository(db)
 	systemService := NewSystemService(systemRepo, "revision-concurrency-secret-0123456789", time.Hour)
-	svc := NewZoneRevisionService(db, revisionRepo, zoneRepo, programRepo, validationRepo, systemService)
-	return persistentRevisionStack{db: db, path: path, service: svc, revision: revisionRepo, zone: zoneRepo}
+	svc := NewZoneRevisionService(db, revisionStore, zoneRepo, programRepo, validationRepo, systemService)
+	return db, path, svc
+}
+
+func openPersistentStack(t *testing.T) persistentRevisionStack {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "revision-concurrency.db")
+	db, path, svc := buildStack(t, path, nil)
+	zoneRepo := repository.NewSafetyZoneRepository(db)
+	return persistentRevisionStack{db: db, path: path, service: svc, zone: zoneRepo}
 }
 
 func (stack *persistentRevisionStack) close(t *testing.T) {
@@ -74,22 +86,90 @@ func (stack *persistentRevisionStack) close(t *testing.T) {
 func (stack *persistentRevisionStack) reopen(t *testing.T) persistentRevisionStack {
 	t.Helper()
 	stack.close(t)
-	db, err := gorm.Open(sqlite.Open(persistentDSN(stack.path)), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("reopen file sqlite: %v", err)
-	}
-	if sqlDB, err := db.DB(); err == nil {
-		sqlDB.SetMaxOpenConns(4)
-		sqlDB.SetMaxIdleConns(4)
-	}
-	systemRepo := repository.NewSystemRepository(db)
+	db, path, svc := buildStack(t, stack.path, nil)
 	zoneRepo := repository.NewSafetyZoneRepository(db)
-	revisionRepo := repository.NewZoneRevisionRepository(db)
-	programRepo := repository.NewMotionProgramRepository(db)
-	validationRepo := repository.NewValidationRunRepository(db)
-	systemService := NewSystemService(systemRepo, "revision-concurrency-secret-0123456789", time.Hour)
-	svc := NewZoneRevisionService(db, revisionRepo, zoneRepo, programRepo, validationRepo, systemService)
-	return persistentRevisionStack{db: db, path: stack.path, service: svc, revision: revisionRepo, zone: zoneRepo}
+	return persistentRevisionStack{db: db, path: path, service: svc, zone: zoneRepo}
+}
+
+// faultingRevisionStore is a test-only wrapper around the real revision
+// repository. It fails the impact-persistence stage after the first impact row
+// has been written in a transaction, so the rollback demonstrably discards a
+// real partial write. Every other call delegates to the real repository.
+type faultingRevisionStore struct {
+	real repository.RevisionStore
+}
+
+func (store *faultingRevisionStore) Create(revision *model.ZoneRevision) error {
+	return store.real.Create(revision)
+}
+func (store *faultingRevisionStore) Update(revision *model.ZoneRevision) error {
+	return store.real.Update(revision)
+}
+func (store *faultingRevisionStore) OpenDraft(zoneID uint) (model.ZoneRevision, error) {
+	return store.real.OpenDraft(zoneID)
+}
+func (store *faultingRevisionStore) Get(id uint) (model.ZoneRevision, error) {
+	return store.real.Get(id)
+}
+func (store *faultingRevisionStore) GetForZone(zoneID, revisionID uint) (model.ZoneRevision, error) {
+	return store.real.GetForZone(zoneID, revisionID)
+}
+func (store *faultingRevisionStore) ListByZone(zoneID uint) ([]model.ZoneRevision, error) {
+	return store.real.ListByZone(zoneID)
+}
+func (store *faultingRevisionStore) Impacts(revisionID uint) ([]model.ZoneRevisionImpact, error) {
+	return store.real.Impacts(revisionID)
+}
+func (store *faultingRevisionStore) ReevaluationFlags(revisionID uint) ([]model.ValidationReevaluation, error) {
+	return store.real.ReevaluationFlags(revisionID)
+}
+func (store *faultingRevisionStore) WithDB(tx *gorm.DB) repository.RevisionTxStore {
+	return &faultingRevisionTxStore{real: store.real.WithDB(tx)}
+}
+
+type faultingRevisionTxStore struct {
+	real repository.RevisionTxStore
+}
+
+func (store *faultingRevisionTxStore) ApplyRevisionToZone(zoneID uint, expectedVersion, newVersion int, revision model.ZoneRevision) error {
+	return store.real.ApplyRevisionToZone(zoneID, expectedVersion, newVersion, revision)
+}
+func (store *faultingRevisionTxStore) Publish(id uint, baseVersion, publishedVersion int, publishedAt any) error {
+	return store.real.Publish(id, baseVersion, publishedVersion, publishedAt)
+}
+func (store *faultingRevisionTxStore) CreateImpact(impact *model.ZoneRevisionImpact) error {
+	if err := store.real.CreateImpact(impact); err != nil {
+		return err
+	}
+	// Fail the impact-persistence stage after the first impact row is written.
+	return &faultStageError{stage: stagePersistImpacts}
+}
+func (store *faultingRevisionTxStore) CreateReevaluation(flag *model.ValidationReevaluation) error {
+	return store.real.CreateReevaluation(flag)
+}
+func (store *faultingRevisionTxStore) ExistingReevaluationFlag(validationRunID uint) (model.ValidationReevaluation, error) {
+	return store.real.ExistingReevaluationFlag(validationRunID)
+}
+
+// stagePersistImpacts names the single faulted publish stage; it is defined
+// only in the test assembly, never in production code.
+const stagePersistImpacts = "persist_impacts"
+
+type faultStageError struct{ stage string }
+
+func (err *faultStageError) Error() string { return "injected failure at publish stage: " + err.stage }
+func (err *faultStageError) Stage() string { return err.stage }
+
+// openFaultStack wires the revision service with the faulting revision store.
+func openFaultStack(t *testing.T) persistentRevisionStack {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "revision-fault.db")
+	factory := func(_ *gorm.DB, real repository.RevisionStore) repository.RevisionStore {
+		return &faultingRevisionStore{real: real}
+	}
+	db, path, svc := buildStack(t, path, factory)
+	zoneRepo := repository.NewSafetyZoneRepository(db)
+	return persistentRevisionStack{db: db, path: path, service: svc, zone: zoneRepo}
 }
 
 type persistentFixture struct {
@@ -226,32 +306,33 @@ func TestConcurrentPublishSingleWinner(t *testing.T) {
 // persistence stage. Zone, draft, impacts and re-evaluation flags must stay at
 // their pre-publish state, including after a service restart re-reads the file.
 func TestFaultDuringImpactWriteRollsBackEverything(t *testing.T) {
-	stack := openPersistentStack(t)
+	stack := openFaultStack(t)
 	defer stack.close(t)
 	fixture := seedPersistentFixture(t, stack)
-	stack.service.setFaultAtStage(stagePersistImpacts)
 
 	_, err := stack.service.Publish(fixture.zone.ID, dto.PublishZoneRevisionRequest{}, fixture.actor, "faulty-publish")
 	if err == nil {
 		t.Fatal("expected the injected impact-stage failure to abort publish")
 	}
-	var appError *AppError
-	if !errors.As(err, &appError) || !strings.Contains(appError.Message, stagePersistImpacts) {
+	// The error must pinpoint the stage; the production service wraps the cause
+	// but does not itself know anything about fault injection.
+	var stageErr *faultStageError
+	if !errors.As(err, &stageErr) || stageErr.Stage() != stagePersistImpacts {
 		t.Fatalf("expected an error naming stage %q, got %v", stagePersistImpacts, err)
 	}
 
 	// State must be entirely pre-publish.
 	assertPrePublishState(t, stack, fixture)
 
-	// Restart the service against the same on-disk database and confirm the
-	// rollback survived: nothing partial was persisted.
+	// Restart the service against the same on-disk database with a clean,
+	// non-faulting assembly and confirm the rollback survived: nothing partial
+	// was persisted and no fault state carried over.
 	restarted := stack.reopen(t)
 	defer restarted.close(t)
 	assertPrePublishState(t, restarted, fixture)
 
 	// The untouched open draft is still usable through the restarted service:
-	// clear the fault and publish succeeds, producing version + impacts.
-	restarted.service.setFaultAtStage("")
+	// publish succeeds, producing version + impacts.
 	published, err := restarted.service.Publish(fixture.zone.ID, dto.PublishZoneRevisionRequest{}, fixture.actor, "post-restart-publish")
 	if err != nil {
 		t.Fatalf("publish after restart must succeed, got %v", err)

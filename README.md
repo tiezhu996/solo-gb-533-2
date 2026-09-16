@@ -92,7 +92,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 
 前端在 `/zones` 页选中区域后，通过共享 `RevisionPanel` 组件展示唯一草案、发布按钮、最近一次发布的逐程序影响表，以及待重评的已接受校验清单；绘制画布的“Revise (draft)”把修订写入该模块的草案，而不是直接覆盖活动区域。新增 `RevisionStatus = draft | published` 枚举（后端 `constants/zone_revision.go`，前端 `types/enums/revision-status.ts`）。
 
-并发与故障注入：两个请求并发提交同一份草案时，发布事务以 IMMEDIATE 写锁串行落库，区域版本的条件更新保证只有一个请求把版本推进一格，另一个返回可重试的 409（`version_conflict`/`state_conflict`/`draft_missing`，取决于其相对胜者提交的调度位置），重试前需重新建草案。发布按命名阶段（加载活动程序、推进区域版本、草案转发布、写影响、写重评标记、审计）执行，任一阶段失败整体回滚。`backend/internal/service/zone_revision_concurrency_test.go` 在**文件级 WAL SQLite、多连接、真实并发 goroutine**（无内存替身、不串行化）上覆盖：并发发布唯一胜者与失败方可重试；在“写影响”阶段注入失败后，区域、草案、影响和重评标记一起保持发布前状态，且关闭并以新连接池重开同一数据库（模拟重启）后仍回读为未变更，再清掉故障即可正常发布。
+并发与故障注入：两个请求并发提交同一份草案时，发布事务以 IMMEDIATE 写锁串行落库，区域版本的条件更新保证只有一个请求把版本推进一格，另一个返回可重试的 409（`version_conflict`/`state_conflict`/`draft_missing`，取决于其相对胜者提交的调度位置），重试前需重新建草案。发布由区域版本条件更新、草案发布、影响写入、重评标记、审计等步骤在同一事务内顺序完成，任一写入失败整体回滚；生产服务本身不含任何故障/逐阶段判断字段。故障注入只从测试装配进入：`service` 依赖仓储接口 `repository.RevisionStore`/`RevisionTxStore`（生产直接注入真实仓储），故障用例在 `_test.go` 内用一个仅测试可见的 `faultingRevisionStore` 包住真实仓储，在“写影响”阶段写完首行后返回带阶段名的错误。`backend/internal/service/zone_revision_concurrency_test.go` 在**文件级 WAL SQLite、多连接、真实并发 goroutine**（无内存替身、不串行化）上覆盖：并发发布唯一胜者与失败方可重试；在“写影响”阶段注入失败后，区域、草案、影响和重评标记一起保持发布前状态，且关闭并以新连接池重开同一磁盘库（模拟重启，装配不再带故障包装）后仍回读为未变更，随后正常发布成功。
 
 ## 包络算法、假设与误差边界
 
